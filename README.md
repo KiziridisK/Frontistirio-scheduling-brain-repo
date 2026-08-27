@@ -13,6 +13,7 @@
 
 ## Table of contents
 
+0. [Changelog — 2026-08 rework](#0-changelog--2026-08-rework)
 1. [What it does (concept)](#1-what-it-does-concept)
 2. [End-to-end flow](#2-end-to-end-flow)
 3. [Inputs — the data the algorithm consumes](#3-inputs--the-data-the-algorithm-consumes)
@@ -26,6 +27,142 @@
 11. [Known limitations & failure modes](#11-known-limitations--failure-modes)
 12. [Data prerequisites & troubleshooting](#12-data-prerequisites--troubleshooting)
 13. [File map](#13-file-map)
+
+---
+
+## 0. Changelog — 2026-08 rework
+
+> **A "generate placed 0/35" debugging session on 2026-08-25/27 turned into a substantial
+> rework of the algorithm, the move logic, the frontend grid and the failure reporting.**
+> Sections 6–11 below still describe the *original* June design; where a section is now
+> outdated it carries an **`UPDATED 2026-08`** note pointing back here. This §0 is the
+> authoritative description of current behaviour. All changes are implemented in code
+> (pending the user's API deploy + web build/OTA at the time of writing).
+
+### 0.1 New diagnostic tooling
+
+- **`scripts/diagnoseSchedule.js <store_id> [--full]`** (Frontistirio-API) — a **read-only
+  dry-run**: runs the exact gather→build→place pipeline without persisting, and prints a
+  summary (teachers/rooms with availability, slot window, placed/unscheduled, reason
+  counts), per-teacher/room availability days, and per-lesson failure reasons. **The
+  fastest way to debug a bad generation.** Backed by a new `exports.diagnose(store_id,
+  periodId)` in the handler.
+- `generateForStore` now `console.log`s a compact `buildDiagnostics()` summary on every run.
+
+### 0.2 Root causes found (and the two that were data, not code)
+
+1. **Missing availability data** — generation resolves the **store default period**; it
+   silently places nothing if teacher/room `period_availability` isn't set *for that
+   period*, even though lessons still get *built* from `period_courses`. `buildLessons`
+   succeeding ≠ availability exists. (No code bug — the reasons now say this explicitly.)
+2. **Placement rigidity** — see 0.3.
+3. **Break/grid misalignment** — see 0.4.
+
+### 0.3 `placeLessons` — frontier ➜ **scan-forward** (supersedes §6.5)
+
+The per-teacher-day **frontier** was removed. The old code committed to ONE start slot
+and abandoned the whole day if no room/student was free there (e.g. teacher free 10:30 but
+rooms open 11:00 ⇒ *all* his lessons `no_room`). Now, for each candidate day it **scans
+every start index** `for (fIdx = 0; fIdx + hours <= numSlots; fIdx++)` and places at the
+**earliest** slot where the whole block is teaching-time + teacher-free + students-free +
+a room fits. A `startedDays` set only *biases day preference* (prefer days the teacher
+already teaches) — it no longer hard-gates placement. Net effect on the live store: 23→3
+then →0 unscheduled. **"No gaps in a teacher's day" (old C9) is therefore now a soft
+preference, not a structural guarantee.**
+
+### 0.4 `buildSlotGrid` — uniform grid ➜ **break-aware** (supersedes §6.4)
+
+The old grid was uniform (`slotStart(i) = minStart + i*D`); odd-length breaks (5/10/15′)
+each **killed a whole D-slot AND knocked the phase out of alignment**, so continuous
+multi-hour lessons couldn't fit between breaks. The grid is now built by **walking
+minStart→maxEnd in D steps, jumping past any break and restarting the phase at the
+break's end** (using the UNION of `breaksByDay` across days — a simplification, fine when
+weekday breaks are identical). Slots are therefore **non-uniform** (variable startTimes,
+e.g. …16:30–17:15, 17:20–18:05…) and follow the store's real bell schedule. `numSlots`
+comes from the built array; `slotStart(i)`/`slotEnd(i)` read from arrays, not arithmetic.
+The data-driven frontend renders whatever `time_slots` it's given.
+
+### 0.5 Breaks **split** multi-hour lessons — they no longer block them (supersedes C8/C10)
+
+Per the user: *a break must not prevent a 2h/3h lesson; it just interrupts it* (2h =
+1h·break·1h; 3h = 2h·break·1h). The **contiguity check was removed** from `placeLessons`
+(and from `explainLesson`). A block is now `hours` **consecutive teaching-slot indices** —
+a break may sit between two of them. Consequently an entry's `endTime = slotEnd(startIdx +
+hours - 1)` **carries the break gap**, so wall-clock span can exceed `hours × D`
+(e.g. a 2h lesson stored as `16:30–18:05`). On the live store 23/38 entries legitimately
+span a break. **Nothing is ever scheduled *during* a break** — the slots themselves are
+break-free; only the gap *between* two of a lesson's slots may be a break.
+
+### 0.6 Class scheduling rules (new hard/soft constraints — C11–C13)
+
+Added to `placeLessons` (apply to `type:"class"` only; private lessons exempt):
+
+| # | Rule | Type | Mechanism |
+|---|---|---|---|
+| C11 | A class must **not have the same course twice on one day** | hard | `classDayCourses["<classId>\|<day>"]` (Set of course_id); day skipped if hit → reason `class_course_repeat` |
+| C12 | Ideally **not the same course on two consecutive days** | soft | `adjacencyPenalty(day)` sorts non-adjacent days first in `availDays` |
+| C13 | A class gets **at most `MAX_CLASS_HOURS_PER_DAY = 6`** teaching hours/day | hard | `classDayHours["<classId>\|<day>"]`; day skipped if the block would exceed it → reason `class_daily_limit` |
+
+`MAX_CLASS_HOURS_PER_DAY` is a **hardcoded constant** (not yet a `StoreSettings` field).
+`moveEntry` does **not** enforce C11–C13 (manual moves stay an admin override).
+
+### 0.7 `moveEntry` rewritten (supersedes §7 steps 3 & the table)
+
+The old move used linear math (`endMin = startMin + hours*D`) and rejected any block
+overlapping a break (`on_break`). It now **builds the same `buildSlotGrid(ctx)`**, finds
+the target start slot by matching `time_slots[i].startTime` (by minutes), takes `hours`
+consecutive slots (**break-spanning allowed**), validates each slot (teacher avail +
+free, room avail + free, students free), and computes the **break-aware** `endTime =
+slotEnd(startIdx+hours-1)`. `on_break` is gone (slots are break-free by construction); a
+slot-not-found returns `move_entry_fail`, an overflow past day end returns
+`teacher_unavailable`.
+
+### 0.8 Failure reporting — specific reasons + per-lesson **`details[]`**
+
+- `unscheduled[].reason` is no longer always `no_valid_slot`. It is the **binding
+  constraint**, chosen by a severity ladder in `placeLessons`:
+  `teacher_no_availability`(0) < `no_teaching_slot`(1) < `class_course_repeat`/`class_daily_limit`(2)
+  < `students_conflict`(3) < `no_room`(4).
+- **New:** each unscheduled lesson carries **`details[]`** — a per-day, structured
+  explanation from `explainLesson()` that names the concrete blocker: *which student is
+  busy in which lesson at what time*, or unavailable, or which class rule fired, or no
+  room. Computed against turn-time occupancy, so every referenced lesson is one already on
+  the timetable. Persisted in a new `unscheduledSchema.details` subdoc
+  (`{ day, kind, student, course, startTime, endTime, hours, limit }`). Rendered on the
+  frontend via `schedule.details.<kind>` ngx-translate templates (params) under the reason
+  line; `component.detailText(d)` translates the day + interpolates.
+- New i18n reason keys: `teacher_no_availability`, `no_teaching_slot`, `class_course_repeat`,
+  `class_daily_limit`, `students_conflict`, `no_room` (the old move-path keys stay).
+
+### 0.9 Frontend grid changes (supersedes parts of §8)
+
+- **Break visualization** — `buildGrid` now composes a `rows[]` of `{kind:'slot'|'break'}`;
+  a **break band** row (full-width, striped, "Διάλειμμα" + time) is inserted wherever two
+  consecutive `time_slots` have a time gap. Break time is derived client-side from the
+  gap (no backend change).
+- **Break-spanning lessons render as multiple segments** — `buildCellMap` splits each
+  entry into **contiguous-slot runs**; each run is a `{state:'start', rowspan, continuation}`
+  cell, so a lesson crossing a break shows as two blocks with the break band between them
+  (a "↓ συνέχεια" label + dashed top on continuation segments). Needs a `slotByIndex` map
+  + `slotContiguous()`. `GridCell` gained `rowspan` and `continuation` (rowspan is the run
+  length, no longer `duration_hours`).
+- **View filters** — a filter-card bar (`.filter-line`/`.filter-select`) above the grid
+  shows only a **τάξη** (`grade_name`), **τμήμα** (`class_id`, options cascade by grade),
+  **καθηγητής** (`teacher_id`) or **μάθημα** (`course_id`). Client-side only: options are
+  derived from the full entry set (stable grid), an `entryVisible()` predicate feeds
+  `buildCellMap()` (split out of `buildGrid`). Needed `FormsModule` in the standalone
+  component's imports for `[(ngModel)]`. New key `general.select.teacher`.
+- **Drag onto an overlapping slot now works** — dragging a lesson excludes it from the
+  cell map (`draggingId`, restored on drop/`dragend`) so its own covered slots become
+  valid drop targets; you can shift a multi-hour lesson onto a time it currently covers.
+  Drops now surface the backend's specific success/error toast instead of silently
+  no-op-ing.
+- **i18n cache-busting** — the `TranslateHttpLoader` suffix is now `` `.json?v=${APP_VERSION}` ``
+  (`app.module.ts`), so a new release fetches fresh translations instead of a stale
+  browser-cached copy (the loader had no cache-busting; a symptom was raw
+  `schedule.details.*` keys showing after a translation change). Tied to the app version —
+  bump the version for translation-only changes.
+- New i18n: `schedule.break`, `schedule.continued`, `schedule.details.*`.
 
 ---
 
@@ -200,7 +337,10 @@ ScheduleEntry (subdoc, has _id) {
 UnscheduledLesson (subdoc, no _id) {
   course_id, teacher_id, class_id, student_id, type, duration_hours,
   course_name, teacher_name, target_name,
-  reason   // i18n key under schedule.reasons.* — currently always "no_valid_slot"
+  reason,  // i18n key under schedule.reasons.* — the BINDING constraint (see §0.8);
+           // was "no_valid_slot" pre-2026-08
+  details  // NEW (§0.8): per-day structured blockers, [{day,kind,student,course,
+           //            startTime,endTime,hours,limit}]
 }
 ```
 
@@ -294,6 +434,12 @@ Longer lessons and bigger groups are placed first (they are the hardest to fit).
 
 ### 6.4 `buildSlotGrid(ctx)` — the teaching-hour grid
 
+> **UPDATED 2026-08 — see [§0.4](#04-buildslotgrid--uniform-grid--break-aware-supersedes-64).**
+> The grid is no longer the uniform `minStart + i*D` described below; it is **break-aware**
+> (the phase restarts after each break, so slots follow the store's bell schedule and are
+> non-uniform). The alignment caveat below is largely resolved by that change. The
+> `minStart`/`maxEnd`/`D`/`numSlots`/fallback inputs are still accurate.
+
 ```
 minStart = min over ALL teacher & room availability range starts
 maxEnd   = max over ALL teacher & room availability range ends
@@ -317,6 +463,14 @@ renders exactly the rows the placement used.
 > Keep availability and `course_hour_duration` on consistent boundaries.
 
 ### 6.5 `placeLessons` — the greedy placement
+
+> **UPDATED 2026-08 — see [§0.3](#03-placelessons--frontier--scan-forward-supersedes-65),
+> [§0.5](#05-breaks-split-multi-hour-lessons--they-no-longer-block-them-supersedes-c8c10),
+> [§0.6](#06-class-scheduling-rules-new-hardsoft-constraints--c11c13).** The **frontier is
+> gone** (replaced by a scan of every start slot); the **contiguity/"cannot straddle a
+> break" check is gone** (lessons split across breaks); and **class rules C11–C13** were
+> added. The occupancy model, `isTeachingSlot`, `findRoom`, `studentsFree` and best-fit
+> room selection below are still accurate.
 
 **Occupancy** is tracked as interval lists keyed `"<id>|<day>"`:
 `teacherBusy`, `roomBusy`, `studentBusy`. A conflict is `intersectsAny(s, e, list)`.
@@ -383,6 +537,11 @@ Schedule.findOneAndUpdate(
 ---
 
 ## 7. Drag-and-drop move re-validation
+
+> **UPDATED 2026-08 — see [§0.7](#07-moveentry-rewritten-supersedes-7-steps-3--the-table).**
+> `moveEntry` now reuses `buildSlotGrid` + slot-index matching (break-aware end time,
+> break-spanning allowed); step 3's linear `endMin = startMin + hours*D` and the `on_break`
+> row are obsolete. The other checks in the table still hold.
 
 `moveEntry(store_id, periodId, { entryId, dayOfWeek, startTime, classroom_id }, user_id)`:
 
@@ -501,11 +660,15 @@ target/course/teacher and `schedule.reasons.<reason>`.
 | C5 | Classroom capacity ≥ group size | hard | `findRoom` / move `no_room_capacity` |
 | C6 | No student during their unavailability | hard | `studentsFree` / move `studentBlocked` |
 | C7 | No student double-booked | hard | `studentBusy` / move `studentIntervals` |
-| C8 | No lesson on a break | hard | `isTeachingSlot` (breaks) / move `on_break` |
-| C9 | No gaps in a teacher's day | structural (best-effort) | frontier placement (gen only) |
-| C10 | A lesson cannot straddle a break / availability gap | hard | block-all-teaching-slots check |
+| C8 | No lesson **during** a break | hard | slots are break-free by construction (§0.4) |
+| C9 | ~~No gaps in a teacher's day~~ | ~~structural~~ → **soft** | now only a `startedDays` day-preference bias (§0.3) |
+| C10 | ~~A lesson cannot straddle a break~~ | **removed** | breaks now **split** a lesson (§0.5) |
+| C11 | Class: no same course twice on one day | hard | `classDayCourses` (§0.6) |
+| C12 | Class: ideally not same course on consecutive days | soft | `adjacencyPenalty` (§0.6) |
+| C13 | Class: ≤ 6 teaching hours/day | hard | `classDayHours` (§0.6) |
 
 "Touching" boundaries never conflict (half-open intervals, [§6.1](#61-time-helpers)).
+**C8–C13 updated 2026-08 — see [§0.5](#05-breaks-split-multi-hour-lessons--they-no-longer-block-them-supersedes-c8c10)/[§0.6](#06-class-scheduling-rules-new-hardsoft-constraints--c11c13).**
 
 ---
 
@@ -521,12 +684,12 @@ This is the section to read before changing scheduling behaviour. Each row says
 | **Which days are scheduled** | Currently = days a teacher has availability (`availDays` in `placeLessons`). Add days by giving teachers availability on them; teacher `workdays.dayOfWeek` is capped 1-6 in the model — raise to 7 to allow Sundays. |
 | **Lesson priority (which lessons win the good slots)** | `buildLessons` final `lessons.sort(...)`. Currently hours desc → group size desc. Add tie-breakers (e.g. teachers with least availability first). |
 | **Spread vs. pack days** | `placeLessons` `availDays.sort(...)`. Currently prefers already-started days (packs). Reverse to spread lessons across more days. |
-| **Relax "no gaps"** (allow non-contiguous teacher days to place more lessons) | `placeLessons`: instead of only trying `fIdx = frontier`, scan all start indices `for (let s=firstTeachingSlot; s+hours<=numSlots; s++)`. This trades contiguity for fewer `unscheduled`. |
+| ~~**Relax "no gaps"**~~ **DONE (§0.3)** | `placeLessons` already scans all start indices (frontier removed). |
 | **Room selection policy** | `roomsByCapacity` (best-fit, smallest sufficient) + `findRoom`. Change the sort for worst-fit, or add a preferred/"sticky" room per course/class, or keep a class in one room all week. |
 | **Capacity rule** | `findRoom`: `room.capacity >= count`. Add slack, or per-course room requirements (projector etc. — `ClassRoom.equipment`). |
 | **Break source** | `breaksByDay` from `StoreSettings.break_times`. To make breaks period-scoped, move them into a period array and read via `findPeriodEntry`. |
 | **Conflict semantics (touching)** | `overlaps()` is half-open. Switch to `<=`/`>=` to forbid back-to-back. |
-| **Allow a lesson to span a break** | currently forbidden by the block-all-teaching-slots check; would require splitting a session, which the model does not represent. |
+| ~~**Allow a lesson to span a break**~~ **DONE (§0.5)** | contiguity check removed; a lesson now splits across breaks and the frontend renders it as segments. |
 | **Make a hard constraint soft** (e.g. allow capacity overflow with a warning) | move the check out of the `continue`/reason path and record a soft flag on the entry instead. |
 | **Persist manual edits across regenerate** | regenerate overwrites `entries`. Add a "locked" flag per entry and have `placeLessons` seed occupancy from locked entries before placing the rest. |
 | **Better solver** | replace `placeLessons` with a backtracking/CSP or ILP solver; keep `gatherContext` + the `Schedule` output contract so the frontend is unaffected. |
@@ -534,6 +697,16 @@ This is the section to read before changing scheduling behaviour. Each row says
 ---
 
 ## 11. Known limitations & failure modes
+
+> **UPDATED 2026-08.** Several items below were fixed: "no gaps pushes to unscheduled"
+> (frontier gone, §0.3), "multi-hour lesson cannot cross a break" (now splits, §0.5),
+> "slot-grid alignment" (break-aware, §0.4), "move targets empty cells only" (drag frees
+> the lesson's own slots, §0.9), and "`unscheduled.reason` is coarse" (specific reasons +
+> `details[]`, §0.8). **Still true:** greedy/order-dependent (and `buildLessons` still
+> orders hardest-first by hours→group size, **not** by teacher-availability scarcity, so a
+> very constrained teacher can still be edged out once a class fills up — a
+> most-constrained-first ordering would help); regenerate replaces the schedule (manual
+> DnD lost); no real-time sync.
 
 - **Greedy & order-dependent.** Result depends on lesson ordering; not guaranteed
   optimal or to place everything even if a perfect timetable exists.
@@ -584,20 +757,24 @@ Troubleshooting symptoms:
 ## 13. File map
 
 **Backend (`Frontistirio-API`)**
-- `models/schedule.js` — `Schedule` + `ScheduleEntry` + `UnscheduledLesson`.
-- `controllers/handlers/schedule.js` — `gatherContext`, `buildLessons`, `buildSlotGrid`,
-  `placeLessons`, `generateForStore`, `getStoreSchedule`, `moveEntry` (+ time helpers).
+- `models/schedule.js` — `Schedule` + `ScheduleEntry` + `UnscheduledLesson` (+ `details[]` subdoc, §0.8).
+- `controllers/handlers/schedule.js` — `gatherContext`, `buildLessons`, `buildSlotGrid`
+  (break-aware), `placeLessons` (scan-forward + class rules + `explainLesson`),
+  `buildDiagnostics`, `generateForStore`, `getStoreSchedule`, `diagnose`, `moveEntry`.
+- `scripts/diagnoseSchedule.js` — read-only diagnostic CLI (§0.1).
 - `controllers/schedule.js` — `resolveContext`, `generateSchedule`, `getStoreSchedule`,
   `moveEntry`.
 - `routes/schedule.js` — mounted at `/schedule` in `index.js`.
 
 **Frontend (`Frontistirio`)**
-- `src/app/models/schedule.model.ts`
+- `src/app/models/schedule.model.ts` (+ `UnscheduledDetail`)
 - `src/app/services/schedule.service.ts`
-- `src/app/scheduling/scheduling.component.{ts,html,scss}`
+- `src/app/scheduling/scheduling.component.{ts,html,scss}` — grid + break bands +
+  multi-segment split + view filters + drag-frees-own-slots (§0.9)
+- `src/app/app.module.ts` — `HttpLoaderFactory` now cache-busts i18n with `?v=${APP_VERSION}` (§0.9)
 - route in `src/app/app-routing.module.ts`, menu in `src/app/app.component.html`
-- i18n in `src/assets/i18n/{el,en}.json` (`schedule.*`, `menu.management.scheduling`,
-  `messages.*`)
+- i18n in `src/assets/i18n/{el,en}.json` (`schedule.*` incl. `break`, `continued`,
+  `reasons.*`, `details.*`; `general.select.teacher`; `menu.management.scheduling`; `messages.*`)
 
 **Inputs (read-only, documented in [§3](#3-inputs--the-data-the-algorithm-consumes))**
 - `models/teacher.js` (`period_courses`, `period_availability`)
