@@ -13,6 +13,7 @@
 
 ## Table of contents
 
+- [Changelog — 2026-09: manual scheduling (hand placement)](#changelog--2026-09-manual-scheduling-hand-placement)
 0. [Changelog — 2026-08 rework](#0-changelog--2026-08-rework)
 1. [What it does (concept)](#1-what-it-does-concept)
 2. [End-to-end flow](#2-end-to-end-flow)
@@ -27,6 +28,162 @@
 11. [Known limitations & failure modes](#11-known-limitations--failure-modes)
 12. [Data prerequisites & troubleshooting](#12-data-prerequisites--troubleshooting)
 13. [File map](#13-file-map)
+
+---
+
+## Changelog — 2026-09: manual scheduling (hand placement)
+
+> **A whole new mode was added alongside auto-generate: the admin can now build
+> the timetable BY HAND**, dragging lessons from a palette onto the grid, with a
+> collected "missing data" list telling them exactly what to fix. This is the
+> authoritative description of that feature; where it changes earlier behaviour
+> the relevant section carries an **`UPDATED 2026-09`** note. Implemented in code
+> (pending the user's API deploy + web build/OTA at the time of writing).
+
+### N.1 Concept — τμημα-centric palette (vs the teacher-centric generator)
+
+The auto-generator builds its work list from **`Teacher.period_courses`**
+(teacher-centric): a course a teacher isn't assigned to simply never appears, so
+a class course with no teacher vanishes silently. The manual palette instead
+reads **`ClassModel.period_courses[period].courses[]`** (τμημα-centric) — the
+source of truth for *what a τμήμα must be taught* — so a course with no teacher
+or no frequency/hours is **surfaced as an issue** instead of disappearing.
+
+- **Palette** = what still needs placing, grouped **τάξη (`Grade`) → τμήμα
+  (`ClassModel`) → course**. Frequency/hours come from `Course.period_schedule`;
+  a course with `sessions_per_week = 2` yields **2 draggable chips**, each
+  showing the course name + that session's `hours_per_session[i]` duration.
+- **Private lessons (ιδιαίτερα)** are gathered separately, from
+  `Teacher.period_courses[].student_ids`, grouped **by student**.
+- **"Remaining" is a multiset subtraction:** for each obligation, the required
+  per-session hours (`hours_per_session`) minus the durations of entries already
+  on the timetable — so `[2,1]` with a 2h lesson already placed leaves one `[1]`
+  chip. Placing (auto **or** manual) consumes chips; the palette shows only
+  what's left. `remainingHours(required, placed)` in the handler.
+
+### N.2 Missing-data issues (the "ελλιπή δεδομένα" list)
+
+A τμήμα course that **cannot** be placed is put in `issues[]` (not the palette),
+each with a description + a link to the course to fix it:
+
+| kind | meaning |
+|---|---|
+| `no_teacher` | course assigned to the τμήμα but no teacher teaches it (no `Teacher.period_courses` names the course **with that class in `class_ids`**) |
+| `no_frequency` | `Course.period_schedule[period].sessions_per_week ≤ 0` (or missing) |
+| `no_hours` | `hours_per_session` missing / shorter than `sessions_per_week` / has a non-positive value |
+
+Private obligations get `no_frequency` / `no_hours` too (never `no_teacher` — a
+private lesson has a teacher by construction). Resolved by `findClassTeacher()`
++ `courseSessions()` inside `buildManualPalette()`.
+
+### N.3 Placement is an admin OVERRIDE (supersedes §7's strict rejection)
+
+Both hand placement **and** the existing drag-to-move now **override** hard
+constraints instead of rejecting: a lesson dropped on a conflicting cell is
+**still placed**, but flagged. Only a **structurally impossible** target is
+rejected (fatal): `invalid_slot` (no such start slot / block overflows the grid)
+or `room_not_found`. Everything else — teacher/room/student unavailable or
+busy, capacity, on-break — is a **conflict**, collected and returned as
+`warnings[]`, and stamped on the entry. New `ScheduleEntry` fields
+(`models/schedule.js`):
+
+- **`manual: Boolean`** — placed/moved by hand (vs the generator). Used so
+  re-generate can warn before discarding hand-made work.
+- **`has_conflict: Boolean`** + **`conflict_reasons: [String]`** — the entry sits
+  on a hard-constraint violation; the reasons are `schedule.reasons.*` i18n keys.
+
+The frontend renders a conflict entry with a red outline + a "Σύγκρουση" badge
+(reasons in the `title`), and a warning toast on drop. **`moveEntry` no longer
+returns 409 on conflict** — it returns 200 with `warnings[]`; only fatal targets
+return `success:false`.
+
+### N.4 Shared placement core
+
+`moveEntry` was rewritten to share one validator with the new `placeEntry`:
+
+- **`evaluatePlacement(ctx, grid, occupancy, params)`** — the single source of
+  placement rules. Returns `{ fatal }` (impossible) or `{ fatal:null, conflicts[],
+  startTime, endTime }`. Half-open overlap + break checks as everywhere else.
+- **`buildOccupancy(entries, excludeId)`** — teacher/room/student interval lists
+  keyed `id|day`, built from the placed entries (excluding the one being moved).
+- **`gridFromTimeSlots(time_slots, D)`** — wraps a **persisted** `time_slots`
+  array in the same `{numSlots, slotStart, slotEnd, time_slots}` interface
+  `buildSlotGrid` returns. **The persisted grid is now canonical:** once a
+  schedule exists, place/move map onto *its* `time_slots` (not a recomputed grid)
+  so a drop lands on exactly the slots the frontend rendered. Only when no
+  schedule exists yet does `placeEntry` compute a fresh `buildSlotGrid` and
+  persist it (creating the `Schedule` on first manual use — no auto-generate
+  required to start hand-building).
+
+### N.5 Auto-generate now confirms before wiping manual work
+
+`generate` still fully regenerates (replaces `entries`), but the frontend now
+**asks first** (`AlertController`) whenever `schedule.entries` contains any
+`manual` entry — "these hand placements will be lost, continue?" — and only
+regenerates on confirm. (The user chose confirm-and-warn over a preserve/lock
+merge.)
+
+### N.6 Grid shows all WORKING days (fix: "only Monday shows")
+
+`buildGrid` derived day columns **only from days that had entries**, so a
+timetable whose lessons all fell on one day (or a fresh one being hand-built)
+showed a single column and you couldn't drop onto other days. `getManualData`
+now returns **`days[]`** = every day some teacher **or** room has availability
+this period (fallback Mon–Sat); the grid uses **those ∪ entry days**. So every
+working day is a drop target regardless of what's already placed. *(If the grid
+still shows one day after this, the cause is data: availability configured for
+only that day in the period — availability is per-period.)*
+
+### N.7 Backend surface (new)
+
+`gatherContext` now also returns the **`classes`** array (τμήματα) for the
+τμημα-centric palette. New handler exports + routes (all `authMiddleware` +
+`isStoreUser`, tagged `// NEW ROUTE`):
+
+| Method | Path | Handler | Purpose |
+|---|---|---|---|
+| GET  | `/schedule/manual-data` | `getManualData` | grid `time_slots` + `days[]` + `classPalette` + `privatePalette` + `issues` + current `schedule`, in one call |
+| POST | `/schedule/place-entry` | `placeEntry` | hand-place one dragged session (override); creates the schedule + persists the grid on first use; re-resolves student set/labels server-side (never trusts the client) |
+| POST | `/schedule/remove-entry` | `removeEntry` | remove one entry (return it to the palette) |
+
+`placeEntry`/`moveEntry` return `{ success, message, warnings, schedule }` and
+HTTP **200 even on a conflict override** (409 only on a fatal target).
+
+### N.8 Frontend
+
+- **Palette panel** (collapsible, `paletteOpen`) — an `ion-accordion-group`
+  (`[multiple]`): one accordion per τάξη (τμήματα + chips inside), plus an
+  "Ιδιαίτερα" accordion. Chips are native HTML5 `draggable`; `draggedPalette`
+  branches `onDrop` between **placeEntry** (palette chip) and **moveEntry**
+  (existing entry). Count badges per τάξη/τμήμα/panel.
+- **Issues + Unscheduled** are now **collapsible cards BELOW the grid**
+  (`issuesOpen` / `unscheduledOpen`, `.collapsible-card`/`.collapsible-header`).
+  The issues card links each row to `/course/:id` to fix the data.
+- **Entry block** gained a conflict outline + "Σύγκρουση" badge and a **remove
+  (×)** button (kept visible, not hover-only, so it's tappable on touch).
+- Data loads via **`refreshManual()`** (one `getManualData` call) instead of the
+  old `getStoreSchedule`; `buildGrid` reads `this.timeSlots` + `availableDays`.
+- **`RouterModule` added** to the standalone component's imports (needed for the
+  issue `routerLink`s — see the standalone-routerlink gotcha).
+- New i18n: `schedule.manual.*` (palette/issues/regen-confirm/conflict labels),
+  `schedule.issues.{no_teacher,no_frequency,no_hours}`, and `messages.*`
+  (`place_entry_success/conflict/fail`, `remove_entry_success/fail`,
+  `move_entry_conflict`, `invalid_slot`).
+
+### N.9 File map (additions)
+
+- **Backend:** `models/schedule.js` (+ entry `manual`/`has_conflict`/
+  `conflict_reasons`); `controllers/handlers/schedule.js` (+ `gridFromTimeSlots`,
+  `buildOccupancy`, `evaluatePlacement`, `findClassTeacher`, `remainingHours`,
+  `buildManualPalette`, `getManualData`, `placeEntry`, `removeEntry`; `moveEntry`
+  rewritten to override; `gatherContext` returns `classes`); `controllers/
+  schedule.js` (+ `getManualData`/`placeEntry`/`removeEntry`); `routes/
+  schedule.js` (+ 3 routes).
+- **Frontend:** `models/schedule.model.ts` (+ `PaletteSession/Course/Class/Grade`,
+  `PalettePrivate`, `ScheduleIssue`, `ManualData`, `PlaceEntryPayload`, entry
+  flags); `services/schedule.service.ts` (+ `getManualData`/`placeEntry`/
+  `removeEntry`, `ManualDataResponse`, `warnings?`); `scheduling.component.{ts,
+  html,scss}` (palette + collapsible cards + conflict/remove); `i18n/{el,en}.json`.
 
 ---
 
@@ -331,7 +488,11 @@ ScheduleEntry (subdoc, has _id) {
   startTime: "HH:mm", endTime: "HH:mm",
   duration_hours: Number,
   // Denormalized labels so the grid renders without extra lookups:
-  course_name, teacher_name, classroom_name, target_name, grade_name
+  course_name, teacher_name, classroom_name, target_name, grade_name,
+  // Manual-scheduling flags (2026-09 — see the top changelog):
+  manual,           // placed/moved by hand vs the auto generator
+  has_conflict,     // sits on a hard-constraint violation (admin override)
+  conflict_reasons, // [i18n reason keys] of the broken constraints
 }
 
 UnscheduledLesson (subdoc, no _id) {
@@ -353,6 +514,10 @@ UnscheduledLesson (subdoc, no _id) {
 
 `routes/schedule.js` (mounted in `index.js` as `app.use("/schedule", scheduleRoutes)`),
 all behind `authMiddleware` + `isStoreUser`:
+
+> **UPDATED 2026-09 — three more store routes for manual scheduling:
+> `GET /manual-data`, `POST /place-entry`, `POST /remove-entry` (see the top
+> changelog §N.7). `move-entry` now returns 200 even on a conflict override.**
 
 | Method | Path | Controller | Purpose |
 |---|---|---|---|
@@ -537,6 +702,15 @@ Schedule.findOneAndUpdate(
 ---
 
 ## 7. Drag-and-drop move re-validation
+
+> **UPDATED 2026-09 — `moveEntry` was rewritten again to share the
+> `evaluatePlacement` validator with the new `placeEntry`, and is now an admin
+> OVERRIDE: a move onto a conflicting cell is APPLIED and flagged
+> (`has_conflict` + `conflict_reasons`, reasons returned as `warnings[]`),
+> NOT rejected. Only a fatal target (`invalid_slot` / `room_not_found`) fails.
+> It also maps onto the persisted (canonical) grid. The strict "first failure
+> returns its reason key, HTTP 409" table below is therefore superseded — see
+> the top changelog §N.3–N.4.**
 
 > **UPDATED 2026-08 — see [§0.7](#07-moveentry-rewritten-supersedes-7-steps-3--the-table).**
 > `moveEntry` now reuses `buildSlotGrid` + slot-index matching (break-aware end time,
@@ -755,6 +929,10 @@ Troubleshooting symptoms:
 ---
 
 ## 13. File map
+
+> **UPDATED 2026-09 — manual-scheduling additions (new handler functions,
+> endpoints, entry flags, palette model + component) are listed in the top
+> changelog §N.9.**
 
 **Backend (`Frontistirio-API`)**
 - `models/schedule.js` — `Schedule` + `ScheduleEntry` + `UnscheduledLesson` (+ `details[]` subdoc, §0.8).
