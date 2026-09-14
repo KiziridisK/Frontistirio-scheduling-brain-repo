@@ -13,6 +13,7 @@
 
 ## Table of contents
 
+- [Changelog — 2026-09 (b): per-role timetables, co-teaching, multiple schedules](#changelog--2026-09-b-per-role-timetables-co-teaching-multiple-schedules)
 - [Changelog — 2026-09: manual scheduling (hand placement)](#changelog--2026-09-manual-scheduling-hand-placement)
 0. [Changelog — 2026-08 rework](#0-changelog--2026-08-rework)
 1. [What it does (concept)](#1-what-it-does-concept)
@@ -28,6 +29,317 @@
 11. [Known limitations & failure modes](#11-known-limitations--failure-modes)
 12. [Data prerequisites & troubleshooting](#12-data-prerequisites--troubleshooting)
 13. [File map](#13-file-map)
+
+---
+
+## Changelog — 2026-09 (b): per-role timetables, co-teaching, multiple schedules
+
+> Recorded **2026-09-14**, verified against `Frontistirio-API` (`controllers/handlers/schedule.js`,
+> `controllers/schedule.js`, `routes/schedule.js`, `models/schedule.js`, `models/course.js`,
+> `controllers/handlers/course.js`, `controllers/calendar.js`) and the `Frontistirio` frontend.
+> Three features built on top of the manual-scheduling work below. All shipped in the API
+> commits `ac77227` (09-04) + `28969a7` (09-05) and the frontend commits `c0fb29e` (09-04) +
+> `47d6a2d` (09-05); OTA release 1.5.12. Where they change older sections, **this block wins**.
+>
+> | When | Feature | Summary |
+> |---|---|---|
+> | 2026-08-28 → 09-14 | **Per-role timetables** (P.1–P.2) | read-only slices of the timetable for student / teacher / parent + PDF export + home "today" widget |
+> | 2026-09-05 | **Co-teaching / συνδιδασκαλία** (P.3–P.7) | several τμήματα and/or ιδιαίτερα taught together as ONE placed lesson |
+> | 2026-09-05 | **Multiple schedules** (P.8–P.11) | one default timetable + date-ranged alternatives (Χριστούγεννα, Πάσχα…) per store+period |
+
+### P.1 Per-role read-only timetables
+
+The admin grid (`/schedules/:id`) is the only editor. Every other role gets a **slice** of
+the timetable that is **active today** (see P.8), read-only:
+
+| Role | Endpoint(s) | Handler | Scope rule |
+|---|---|---|---|
+| store-user (for one student) | `GET /schedule/get-student-schedule?student_id` + `POST /export-student-schedule` | `getStudentSchedule` | `entryBelongsToStudent` |
+| student (self) | `GET /schedule/get-my-schedule` + `POST /export-my-schedule` | `getStudentSchedule` | student resolved from the login (`studentsHandler.getStudentIdByUserId`) — never a client id |
+| teacher (self) | `GET /schedule/get-my-teacher-schedule` + `POST /export-my-teacher-schedule` | `getTeacherSchedule` | `entryBelongsToTeacher` (`teacher_id` match); teacher from `teacherHandler.getTeacherByUserId` + store check |
+| parent (children) | `GET /schedule/get-my-children-schedule` | `getChildrenSchedule` | union over the kids (`getParentIdsByUserId` → `getStudentsByParentIds`); an entry two kids share is kept once |
+
+- All slice handlers return the **same grid definition** as the store schedule
+  (`{ entries, time_slots, slot_minutes, generatedAt, student|teacher }`), so the frontend renders
+  an identical weekly grid. A student/teacher is never double-booked → **no classroom
+  sub-columns** (rows = slots, columns = days).
+- **PDF:** `helpers/createStudentSchedulePdf.js` (pdfkit, landscape A4, class lessons blue,
+  ιδιαίτερα amber, DejaVuSans). Uploaded to bucket **`logeion-test-cycle-reports`** under
+  `student-schedules/<group>/<store>/…` → 60 s signed URL. The **teacher export reuses the
+  student PDF** by passing `{ ...data, student: data.teacher }` — `getTeacherSchedule`
+  normalises the teacher's `first_name/last_name` to `firstName/lastName` for exactly this.
+  Break gaps show as time jumps in the PDF (no break bands, unlike the web grid).
+- The parent has **no PDF and no dedicated page** — only the home widget.
+
+**Frontend**
+
+- `students/student-schedule/` (`app-student-schedule`, standalone, imported in `app.module.ts`
+  because `StudentDetailsComponent` is module-declared): inputs `student` (admin → student-details
+  **SCHEDULE** tab) or `self` (student → `/my-schedule`, RoleGuard `['student']`, page
+  `student/my-schedule/`). **UI rework 2026-09-14:** defaults to a **per-day agenda** with a
+  Day|Week toggle persisted in `localStorage['studentSchedule.view']`; weekday picker (Sun only if
+  used, count per day, today dot, default = today or next day with lessons); lesson cards with the
+  course name minus its τάξη prefix (`withoutPrefix` in `shared/list-card.util.ts`), a course hue
+  bar, teacher/room/co-teaching, gap rows (Κενό/Διάλειμμα), now/next/done status refreshed every
+  60 s; the week grid is trimmed to the first..last used slot; admin-only link to `/schedules`.
+  i18n `schedule.student_view.*`.
+- `teacher/teacher-schedule/` (`app-teacher-schedule`, route **`/my-teaching-schedule`**, RoleGuard
+  `['teacher']`): same grid, only the teacher's lessons; view filters limited to **τάξη + τμήμα**
+  (a teacher can't pick other teachers/courses); PDF export. i18n `teacher.{my_schedule,
+  no_teacher_schedule}`.
+- `today-schedule/` (`app-today-schedule`, standalone, `@Input() userRole`): the home **"Σημερινά
+  μαθήματα"** widget — calls the role's endpoint and keeps entries whose `dayOfWeek` = today
+  (JS `getDay()` 0=Sun → 7). Student + teacher get it at the top of their home dashboard main
+  column; the parent gets it in the home aside; store-user never (has the full grid).
+  "Full schedule" link → `/my-schedule` / `/my-teaching-schedule` (none for parents).
+- `services/schedule.service.ts`: `getStudentSchedule`, `exportStudentSchedule`, `getMySchedule`,
+  `exportMySchedule`, `getMyTeacherSchedule`, `exportMyTeacherSchedule`, `getMyChildrenSchedule`.
+
+### P.2 Belongs-to predicates (one rule for grids AND calendar)
+
+Extracted as pure, exported functions in `handlers/schedule.js`, so the timetable pages and the
+calendar's lesson feed (see the **calendar brain repo**) can never disagree about who sees what:
+
+```js
+entryBelongsToStudent(e, sid, classId)   // student_ids ∋ sid
+                                         // || (private && student_id == sid)
+                                         // || (class && (class_id == classId || class_ids ∋ classId))
+entryBelongsToTeacher(e, tid)            // teacher_id == tid
+entryBelongsToAnyChild(e, idSet, classIdSet)  // same as student, over sets
+getStudentScope(store, period, studentId)     // → { sid, classId }   (period_class lookup)
+getChildrenScope(store, period, studentIds)   // → { idSet, classIdSet }
+```
+
+The `class_id`/`class_ids` clause is the **safety net** for a student enrolled into a τμήμα
+*after* the timetable was generated (their id isn't in `student_ids` yet). `class_ids` makes it
+co-teaching-aware (a co-taught entry has `class_id: null`).
+
+### P.3 Co-teaching (συνδιδασκαλία) — concept & data model
+
+An admin declares, **per course and per period**, that several τμήματα and/or ιδιαίτερα students
+are taught **together as one physical lesson** (e.g. Β1 + Β2 attend Έκθεση jointly → 7 students,
+one teacher, one room, one placement). Members not in any group schedule independently as before.
+
+```js
+// models/course.js
+period_coteaching: [{
+  period: ObjectId → TeachingPeriod,
+  groups: [{ _id /* auto — the key schedule entries reference */,
+             label: String,            // optional, e.g. "Β Έκθεση κοινό"
+             class_ids:   [ObjectId → ClassModel],
+             student_ids: [ObjectId → Student] }]
+}]
+
+// models/schedule.js — scheduleEntrySchema additions
+class_ids:        [ObjectId]   // every τμήμα attending; normal class lesson → [class_id]; private → []
+coteaching:       Boolean      // true → class_id is null
+coteach_group_id: ObjectId     // → Course.period_coteaching[].groups[]._id
+```
+
+- A τμήμα / μαθητής belongs to **at most one group per course** (deduped on save, first wins);
+  empty groups are dropped.
+- **Teacher is auto-derived** (user decision, no teacher picker): `resolveGroupTeacher` finds the
+  teachers whose `Teacher.period_courses[period].courses[course]` includes ANY of the group's
+  τμήματα/students. Exactly 1 → that teacher; 0 → `no_teacher`; >1 →
+  **`coteaching_teacher_conflict`** (never silently placed).
+
+### P.4 Co-teaching in the generator
+
+- `gatherContext` builds three maps from the courses' `period_coteaching`:
+  `coteachGroups[courseId] = [{ group_id, label, class_ids[], student_ids[] }]`,
+  `classToGroup[courseId][classId]`, `studentToGroup[courseId][studentId]`.
+- Helpers: `coteachLabel(ctx, group)` → `"Β1 + Β2 + Παπαδόπουλος Γ."` (falls back to `label`),
+  `groupStudentIds(ctx, group)` → union of every member τμήμα's roster + explicit students,
+  `resolveGroupTeacher(ctx, periodId, courseId, group)` → `{ teacher, count }`.
+- **`buildLessons` is now two decoupled passes:** (1) one combined lesson per (course, group) ×
+  `sessions_per_week` (`type:"class"`, `coteaching:true`, `classId:null`, `class_ids`, union
+  `studentIds`); unbuildable groups go to `ctx._coteachIssues`; (2) the normal teacher-assignment
+  lessons, **skipping** any τμήμα/student that is a member of a group for that course.
+- **`placeLessons`** applies the class rules (same course twice/day, `MAX_CLASS_HOURS_PER_DAY = 6`,
+  adjacency penalty) to **every** τμήμα of the lesson via `lessonClasses(lesson)`; writes
+  `class_ids / coteaching / coteach_group_id`; appends `ctx._coteachIssues` to `unscheduled`
+  (reason `no_teacher` or `coteaching_teacher_conflict`).
+- A combined lesson is counted **once** (`lessons_total` 2, not 4) — capacity checks use the union.
+
+### P.5 Co-teaching in manual scheduling
+
+- `buildManualPalette` skips grouped τμήματα/students in the τμήμα and ιδιαίτερα palettes and adds
+  **`coteachPalette[]`** — one chip set per (course, group):
+  `{ course_id, course_name, coteach_group_id, label, teacher_id, teacher_name, grade_name,
+  student_count, sessions:[{hours}] }`. Remaining sessions are subtracted by key
+  `` `${coteach_group_id}|${course_id}` ``. Group problems land in `issues[]` with
+  `type:"coteaching"` + `kind` `no_teacher | coteaching_teacher_conflict | no_frequency | no_hours`.
+- `getManualData` returns `coteachPalette` alongside `classPalette` / `privatePalette`.
+- **`placeEntry`** with `type:"class"` + `payload.coteach_group_id` re-resolves the group **server-side**
+  from the Course (τμήματα, union students, label) — the client never supplies the student set —
+  and writes `class_id:null, class_ids, coteaching:true, coteach_group_id`. `moveEntry` is unchanged
+  (it already works off the entry's `student_ids`).
+- Frontend `scheduling.component`: a **"Συνδιδασκαλίες"** palette accordion (`onCoteachDragStart`),
+  `git-merge-outline` icon on co-taught cells, the τμήμα view filter matches `class_ids`, and
+  class-filter options register every `class_id` using names from `selectAllClasses` (a co-taught
+  entry only carries the combined label).
+
+### P.6 Changing a group after lessons are placed — stable ids + stale flag
+
+A `Schedule` is a **snapshot**. Editing a co-teaching group does **not** rewrite placed entries —
+the admin re-generates or removes/re-places (user decision). Two supports:
+
+1. **Stable group `_id`s.** `updateCourseCoteaching` keeps an incoming group `_id` (the frontend
+   carries `CoteachGroup._id` through load → save). Before this fix every course-details save —
+   even an unrelated one — minted new ids, orphaning placed co-taught entries and re-offering the
+   group in the palette (duplicate risk).
+2. **Stale flag (display only).** `getManualData` returns `schedule.toObject()` passed through
+   `markCoteachStale(ctx, entries)`: a co-taught entry gets `coteach_stale:true` when its group is
+   gone or its `class_ids` / student union no longer equal the group's. The grid shows an amber
+   dashed `.entry.stale` + chip `schedule.manual.coteach_outdated` ("Εκτός ημ/νίας", hint
+   `…_hint`). Nothing is auto-reconciled.
+
+### P.7 Co-teaching persistence & the bootstrap-projection trap
+
+- **Save:** `controllers/course.js` `upsertCourseDetails` → if `Array.isArray(body.coteaching)` →
+  `courseHandler.updateCourseCoteaching(courseId, periodId, groups, session, updatedBy)`:
+  `$push` an empty period entry if missing, then `$set "period_coteaching.$[pt].groups"` with an
+  `arrayFilters` on the period (full replace; `[]` clears). **No new route.**
+- **UI:** `course-details.component` — a "Συνδιδασκαλία" card in the ASSIGNMENTS tab: add/remove
+  groups, multi-select of the τμήματα + ιδιαίτερα **already assigned to the course** (an option is
+  disabled when it belongs to another group), optional label; `coteachGroups` takes part in the
+  backup/diff/save of the page. i18n `courses.coteaching.*`, `schedule.manual.coteach_title`,
+  `schedule.{reasons,issues}.coteaching_teacher_conflict`.
+- ⚠️ **Trap (fixed 09-05):** the NgRx store hydrates courses from `GET /bootstrap/getSingle` →
+  `fetchStorePeriodCourses` in `handlers/course.js`, an **aggregation with an explicit `$project`**
+  — not from `get-store-courses`. Its projection omitted `period_coteaching`, so groups vanished on
+  reload although they were in the DB. Fixed by projecting `period_coteaching` (filtered to the
+  period). **Any new per-period Course field must be added to that `$project` too.**
+
+### P.8 Multiple schedules — model & the active-per-date rule
+
+A store+period now holds **many** timetables: exactly one **default** ("Κανονικό πρόγραμμα") plus
+alternatives that are in effect during **date ranges**.
+
+```js
+// models/schedule.js — scheduleSchema additions
+name:        String
+is_default:  Boolean
+date_ranges: [{ start: Date, end: Date }]   // non-default only; end inclusive, compared date-only (UTC)
+
+// indexes (the old unique {store_id, period_id} was dropped)
+{ store_id:1, period_id:1, is_default:1 }                               // list queries
+{ store_id:1, period_id:1 } unique, partialFilterExpression {is_default:true},
+                             name "one_default_per_store_period"        // one default
+```
+
+(Two distinct key patterns on purpose, so Mongoose doesn't warn about duplicate indexes.)
+
+**Rule** — `resolveActiveSchedule(store, period, date = now)`: the non-default schedule whose
+`date_ranges` cover `date` (UTC `YYYY-MM-DD` compare via `dayKey` / `dateInRange`), else the default,
+else the first. `activeScheduleForList(schedules, date)` is the same rule over a preloaded array
+(used by the calendar's per-day loop). Non-default ranges **may not overlap** — each other or any
+other non-default schedule (`validateRanges` → `invalid_range` / `overlapping_range`).
+
+**Migration:** `scripts/migrateSchedules.js` (idempotent) marks each store+period's existing
+schedule as the default; `loadSchedules` also **lazily back-fills** (oldest → default,
+name "Κανονικό πρόγραμμα") if it finds none.
+
+### P.9 Multiple schedules — CRUD and schedule-targeted editing
+
+| Handler | Behaviour |
+|---|---|
+| `listSchedules` | summaries `{ _id, name, is_default, date_ranges, entry_count, unscheduled_count, generatedAt, updatedAt }`, default first then by name |
+| `createSchedule` | the **first** schedule is always the default; making a new default first unsets the old one; ranges validated for non-defaults; starts empty |
+| `updateScheduleMeta` | rename; `is_default:true` → unset the other default first, clear own ranges; ranges only for non-defaults |
+| `deleteSchedule` | refuses to delete the only schedule (`cannot_delete_only_default`); deleting the default **promotes another**; **hard** `deleteOne` |
+| `getScheduleById` / `findScheduleForStore` | verifies the id belongs to the caller's store **and** period and isn't deleted (IDOR guard) |
+| `generateForSchedule(store, period, scheduleId, user)` | runs the (store-wide) generator and replaces **only that doc's** `entries/unscheduled/time_slots`, keeping its meta; no id → the default (created if missing). `generateForStore` kept as a back-compat alias |
+
+`getManualData`, `placeEntry`, `removeEntry`, `moveEntry`, `getStoreSchedule` all take a
+`scheduleId` → `findScheduleForStore` instead of `findOne({store, period})`. The controllers read
+`schedule_id` from the query/body; `place-entry`, `remove-entry`, `move-entry`, `update`, `delete`
+**require** it (`generate` / `get-store-schedule` fall back to the default).
+
+### P.10 Multiple schedules — frontend
+
+- Routing: **`/schedules`** → new standalone `SchedulesComponent` (list); **`/schedules/:id`** → the
+  existing `SchedulingComponent` (the grid editor); **`/scheduling` redirects to `/schedules`**. All
+  RoleGuard `['store-user']`. Menu + home card repointed (`menu.management.schedules`).
+- `SchedulesComponent`: cards (name, «Κανονικό» badge, ranges, entry/unscheduled counts), inline
+  create/edit editor (name + default toggle + `<input type=date>` range rows), delete with confirm,
+  arrow **`routerLink`** to details, `listNav.setList('schedules')` for prev/next.
+- `SchedulingComponent`: reads `scheduleId` from `route.snapshot` (the Ionic route strategy
+  recreates the page on param change, so prev/next reloads correctly) and threads it into every
+  service call; breadcrumb bar (Αρχική → Προγράμματα → name) + `<app-detail-nav navKey="schedules"
+  routeBase="/schedules">`.
+- `schedule.model.ts`: `Schedule.{name,is_default,date_ranges}`, `ScheduleSummary`,
+  `ScheduleDateRange`, `ScheduleEntry.{class_ids,coteaching,coteach_group_id,coteach_stale}`,
+  `PaletteCoteach`, `ManualData.coteachPalette`, `PlaceEntryPayload.coteach_group_id`.
+  i18n `schedule.list.*`.
+
+### P.11 Consumers of the active schedule
+
+- **Per-role slices** (P.1) call `resolveActiveSchedule(atDate || now)`. The controllers never pass
+  `atDate`, so `/my-schedule`, `/my-teaching-schedule`, the student-details tab and the home widget
+  always show the schedule **in effect today** — during Christmas they show the Christmas timetable.
+- **Calendar** (`controllers/calendar.js` `resolveLessonEventsForUser`): loads all schedules once,
+  pre-buckets each schedule's in-scope entries by weekday, then for every day in the visible range
+  picks `activeScheduleForList(schedules, day)` — so a month straddling a holiday range shows the
+  normal lessons before/after it and the alternative ones inside it. store-user excluded. Details in
+  the **calendar brain repo**.
+
+### P.12 Backend surface added (all `authMiddleware`, tagged `// NEW ROUTE`)
+
+| Method | Path | Role | Controller |
+|---|---|---|---|
+| GET | `/schedule/list` | store-user | `listSchedules` |
+| POST | `/schedule/create` | store-user | `createSchedule` (`{ name, is_default, date_ranges }`) |
+| POST | `/schedule/update` | store-user | `updateSchedule` (`{ schedule_id, name?, date_ranges?, is_default? }`) |
+| POST | `/schedule/delete` | store-user | `deleteSchedule` (`{ schedule_id }`) |
+| GET | `/schedule/by-id` | store-user | `getScheduleById` (`?schedule_id`) |
+| GET / POST | `/schedule/get-student-schedule` / `/export-student-schedule` | store-user | one student's slice / PDF |
+| GET / POST | `/schedule/get-my-schedule` / `/export-my-schedule` | student | own slice / PDF |
+| GET / POST | `/schedule/get-my-teacher-schedule` / `/export-my-teacher-schedule` | teacher | own slice / PDF |
+| GET | `/schedule/get-my-children-schedule` | parent | union of children |
+
+Plus `schedule_id` threaded through `generate`, `get-store-schedule`, `manual-data`, `place-entry`,
+`remove-entry`, `move-entry`. All new routes were wired on API Gateway (see the aws-infrastructure
+brain repo's route sync log).
+
+### P.13 Gotchas & open issues
+
+- ⚠️ **`deleteSchedule` on the default — suspected E11000 (not reproduced).** It promotes
+  `others[0]` to `is_default:true` **before** deleting the current default, so for a moment two
+  defaults exist and the partial-unique index `one_default_per_store_period` should reject the
+  `updateOne`. `createSchedule` / `updateScheduleMeta` do it in the safe order (unset first). Fix:
+  delete first (or unset the current flag), then promote.
+- `placeEntry` with an unknown/removed `coteach_group_id` does not reject — it places an entry with
+  no τμήματα/students (it will then show as stale). Low risk: the id comes from the palette.
+- Editing a co-teaching group never updates placed entries (by design, P.6) — the stale chip is the
+  only signal; per-role views and the calendar keep showing the old combined lesson until the admin
+  re-generates / re-places.
+- Role views are always "today's active schedule"; there is no way for a student to preview next
+  week's holiday timetable on `/my-schedule` (the calendar page does show it per date).
+- The calendar expands lessons for **every** date in the visible range — it does not clip to the
+  teaching period's `date_from/date_to` nor skip public holidays unless an alternative schedule
+  covers them.
+- Deleting a schedule is a hard delete (no recycle bin), although reads filter `isDeleted`.
+- Parents: home widget only — no page, no PDF.
+
+### P.14 File map (additions)
+
+- **Backend:** `models/schedule.js` (entry `class_ids/coteaching/coteach_group_id`; schedule
+  `name/is_default/date_ranges` + indexes); `models/course.js` (`period_coteaching`);
+  `controllers/handlers/schedule.js` (co-teaching helpers, `markCoteachStale`, two-pass
+  `buildLessons`, `lessonClasses`, `coteachPalette`, multi-schedule block `dayKey…activeScheduleForList`,
+  belongs-to predicates + scopes, CRUD, `generateForSchedule`, `getTeacherSchedule`,
+  `getChildrenSchedule`, `atDate` on slices); `controllers/schedule.js` (CRUD + my-teacher /
+  my-children + `schedule_id` threading); `routes/schedule.js`; `controllers/handlers/course.js`
+  (`updateCourseCoteaching`, `period_coteaching` in the bootstrap `$project`);
+  `controllers/course.js` (`body.coteaching`); `controllers/calendar.js` (lesson feed);
+  `helpers/createStudentSchedulePdf.js`; `scripts/migrateSchedules.js`.
+- **Frontend:** `schedules/schedules.component.*` (new); `scheduling/scheduling.component.*`
+  (scheduleId, co-teaching palette, stale chip, breadcrumbs/detail-nav);
+  `teacher/teacher-schedule/*` (new); `today-schedule/*` (new); `students/student-schedule/*`;
+  `student/my-schedule/*`; `courses/course-details/*` (co-teaching card);
+  `models/schedule.model.ts`; `services/schedule.service.ts`; `app-routing.module.ts`;
+  `home/home.page.html`; `app.component.html` (menu); `i18n/{el,en}.json`.
 
 ---
 
