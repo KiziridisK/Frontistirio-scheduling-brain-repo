@@ -13,6 +13,9 @@
 
 ## Table of contents
 
+- [Changelog — 2026-11: reproducible runs, candidates, per-schedule hours, room equipment](#changelog--2026-11-reproducible-runs-candidates-per-schedule-hours-room-equipment)
+- [Changelog — 2026-10 (b): the generator becomes a search (API)](#changelog--2026-10-b-the-generator-becomes-a-search-api)
+- [Changelog — 2026-10: the `.sd-*` editor, overview, live check, quality](#changelog--2026-10-the-sd--editor-overview-live-check-quality)
 - [Changelog — 2026-09 (b): per-role timetables, co-teaching, multiple schedules](#changelog--2026-09-b-per-role-timetables-co-teaching-multiple-schedules)
 - [Changelog — 2026-09: manual scheduling (hand placement)](#changelog--2026-09-manual-scheduling-hand-placement)
 0. [Changelog — 2026-08 rework](#0-changelog--2026-08-rework)
@@ -29,6 +32,573 @@
 11. [Known limitations & failure modes](#11-known-limitations--failure-modes)
 12. [Data prerequisites & troubleshooting](#12-data-prerequisites--troubleshooting)
 13. [File map](#13-file-map)
+
+---
+
+## Changelog — 2026-11: reproducible runs, candidates, per-schedule hours, room equipment
+
+> Recorded **2026-11-07** against API `95164a4` + frontend `b6ca8ff` (both on `dev`, **not
+> deployed**). Where this changes §3, §4, §6, §9 or §10, **this block wins.** Bug ids refer to
+> `Frontistirio-bugs-brain-repo/scheduling-bugs.md` §10.
+
+### The thing to know first: the search is now reproducible *on request*
+
+`solveTimetable`'s own comment said "the same input gives the same timetable". It was not true. The
+construction phase is seeded (`mulberry32(opts.seed)`), but the simulated-annealing phase reads
+`Date.now()` for **both** its stopping point and its cooling schedule:
+
+```js
+const progress = Math.max(it / maxIter, (Date.now() - t0) / timeLimitMs);
+```
+
+so a busier machine does fewer iterations, cools on a different curve, and lands somewhere else.
+
+That is harmless for "build me the week" and fatal for anything that shows a result and then
+produces it again — which is exactly what the new generation preview does. A new option:
+
+```js
+solveTimetable(ctx, lessons, grid, { seed, deterministic: true })
+// progress = it / maxIter — no clock in the loop
+```
+
+With `deterministic: true` the run depends **only** on `(seed, maxIterations)`. The iteration budget
+is derived inside `planGeneration` rather than passed in:
+
+```js
+const deterministicIterationCap = (lessonCount) => Math.min(120000, 5000 + 1500 * lessonCount);
+```
+
+so the preview and the later "apply this one" compute the *same* cap from the same data without any
+caller having to remember it. `stats` now carries `deterministic` and `seed`, and the generation
+report passes both to the client.
+
+The time-boxed path is **unchanged** for an ordinary generate: it gets more search done per second,
+and nobody is promising to reproduce it.
+
+### `GET /schedule/preview-generate` — four candidates, nothing written
+
+| | |
+|---|---|
+| Query | `schedule_id`, `mode` (`fresh` \| `fill`) |
+| Seeds | `[20261025, 7, 991, 20260612]` — fixed, so two previews of the same data agree |
+| Returns | `score_before`, `penalties_before`, `lessons_now`, `locked_now`, `lessons_to_place`, and `candidates[]` sorted best-first (ties: fewer unplaced, then lower seed, so the ORDER is stable too) |
+| Each candidate | `seed`, `kept`, `placed`, `unscheduled`, `grid`, `score`, `penalties`, `class_idle_hours`, `teacher_idle_hours`, `room_changes`, `unplaced_lessons[]` (capped at 20), `search{}` |
+| Writes | none — it is a `GET` for that reason |
+
+`score_before` is the same in every candidate (it scores what is on the timetable now), so a
+candidate below it is a run worth **not** applying. That is the point of a preview, and without it a
+score of 78 means nothing.
+
+Applying one is `POST /schedule/generate` with `seed`. The controller turns a finite `seed` into
+`{ seed, deterministic: true }`; without a seed nothing changes.
+
+### `POST /schedule/rebuild-grid` — SCH-06's missing action
+
+The saved `time_slots` **are** the grid, deliberately: otherwise a settings change would slide
+finished lessons off their cells. `staleGridIssues` (2026-11-06) told the admin the grid had drifted;
+this is the action.
+
+- Each entry is kept **iff** the fresh grid has a slot run starting and ending exactly where it does
+  (`sitsOnGrid`). Nothing is moved to a nearby slot: a lesson placed at 17:20 does not quietly become
+  17:00, because a timetable that moved by itself is worse than one that says what it dropped.
+- A dropped entry is simply removed from `entries`. It is **not** written to `unscheduled` — that
+  list is the generator's "could not place, here is why". The palette is computed by subtracting
+  placed entries from the period's obligations, so a dropped lesson reappears there on its own.
+- `confirm: false` (the default) is a **dry run**: nothing is written, the report says what would
+  happen. Widening the teaching window restarts the slot phase at the new earliest hour, which can
+  push *every* lesson off the grid — the admin has to see that number first.
+- A **locked** entry that would not survive refuses the whole action (`locked_entries_off_grid`,
+  with the entries named). A lock promises the lesson stays put, including through a "from scratch"
+  generate; breaking it quietly would make locking worthless.
+- `no_grid_available` when the period has no availability at all: refusing beats replacing a working
+  grid with an empty one.
+
+### `Schedule.working_hours` + `withScheduleWindow` — ALG-06
+
+Availability lives on the teachers and the rooms, **per teaching period**. Right for the normal week,
+wrong for a holiday one: the generator read the same input whichever timetable it filled, so with a
+deterministic search a Christmas schedule came out as a byte-identical copy of the normal one. "Copy
+from another schedule" was the only way to start one.
+
+```js
+// Schedule
+working_hours: [{ dayOfWeek, timeRanges: [{ startTime, endTime }] }]   // [] = the period's hours
+```
+
+```js
+withScheduleWindow(ctx, schedule)
+//  → teacherAvail / roomAvail intersected with the window
+//  → a day the window does not name becomes unavailable to EVERYONE
+//  → scheduleWindow set, so a caller can tell a clipped ctx from a plain one
+//  → an empty window returns ctx untouched
+```
+
+Because `buildSlotGrid` derives the grid from exactly those two maps, the week's hours, its slot
+phase **and** its days all follow from one edit. It is applied at every site that resolves a specific
+schedule: `generateForSchedule`, `previewGeneration`, `rebuildGrid`, `getManualData`,
+`getFullScheduleData`, `placeEntry`, `moveEntry`, `removeEntry` and `copyTimetable`.
+
+`copyTimetable` is where it earns its keep: copying the normal week into a narrower one judges the
+flags under the **target's** hours, so the lessons that no longer fit light up as problems to move.
+
+**It narrows, it does not override.** No teacher is ever placed outside their own availability — the
+window can only remove hours.
+
+`normalizeWorkingHours` drops an unreadable time, an inverted range and a day outside 1–7. A
+malformed window would not narrow anything, it would empty the week with nothing on screen to
+explain it. `[]` on update **clears** the window (hence the check is for an array, not a non-empty
+one); the field being absent means "leave it alone".
+
+### `Course.required_equipment` — ALG-07
+
+`ClassRoom.equipment` (`computer`, `projector`, `whiteboard`) has existed for a long time and
+**nothing ever read it**, because no course said what it needed. The other half:
+
+```js
+// Course
+required_equipment: { computer: Boolean, projector: Boolean, whiteboard: Boolean }  // all false = any room
+```
+
+Three shared helpers (`equipmentOf`, `equipmentNeeded`, `roomMeets`) are exported from
+`scheduleSolver` so the generator's rule and the live check are literally the same lines:
+
+- `it.roomList` filters on capacity **and** equipment. The two are tracked separately so the
+  explanation can say which emptied the list: `no_room` (the φροντιστήριο has no big enough room) and
+  `no_room_equipment` (rooms fit, none has the kit) are different problems fixed in different places.
+  The latter short-circuits `explain` — no day will ever work, so it is said once.
+- `scheduleValidate` adds `room_missing_equipment`. A hand placement into such a room **succeeds**
+  and is flagged, like every other admin override. The flag is derived, so dropping the requirement
+  clears it on the next read.
+- A room the store has deleted is not judged: the same rule capacity and availability follow, so a
+  stale id never invents a conflict.
+- The requirement is normalised server-side to the three known booleans. A requirement no room can
+  declare is one no room can satisfy, and it would make every lesson of that course unplaceable with
+  no way to fix it.
+
+### `POST /schedule/export-full-schedule` — UX-11
+
+`helpers/createFullSchedulePdf.js`. One **landscape** page per teaching day; rows are the grid's
+teaching hours, columns are αίθουσες \| τμήματα \| καθηγητές (`group_by`, default `room`).
+
+- Columns are **paged, not shrunk**: 14 rooms get two sheets rather than 14 unreadable slivers.
+  A column page that is empty for a day is skipped.
+- A lesson with no value for the chosen dimension gets a `—` column instead of being dropped: a
+  printed timetable missing a lesson that is actually happening is the worst outcome.
+- A co-taught lesson prints under **every** τμήμα attending it.
+- Two lessons in one cell print **both**, marked: hiding a double booking on the noticeboard is how
+  two τμήματα end up at the same door.
+- `columnNames` lets the caller name rooms/classes the store has but no lesson uses — an empty room
+  column is information.
+
+### Frontend
+
+| | |
+|---|---|
+| `schedule.service.ts` | `previewGeneration`, `rebuildGrid(id, confirm)`, `exportFullSchedule(id, groupBy)`, `generateSchedule(id, mode, seed?)`. The seed is omitted from the body when absent, so an ordinary run is not silently made deterministic. |
+| Generate menu | third option «Προεπισκόπηση & εναλλακτικές» → radio alert, one line per candidate. |
+| Problems panel | «Η τελευταία αυτόματη δημιουργία» (score before → after, unplaced, search work, chosen variant), and `grid`-type issues in their own section with the rebuild action. |
+| Page menu | «Εκτύπωση συνολικού προγράμματος», «Ξαναχτίσε το πλέγμα ωρών». |
+| History tab (UX-10) | every action of the sitting with its time; undo on the newest un-undone line only (the inverses are only sound LIFO), and a bulk action seals what is under it. |
+| Room pill (UX-09) | narrows the board to one αίθουσα; kept per device, **not** suspended while a lesson is held. |
+| Meta modal | «Ώρες αυτού του προγράμματος»: a switch plus one row per working day. |
+| Course form | «Εξοπλισμός που χρειάζεται», the same three chips the room form declares. |
+| `schedule-grid.util.ts` | `roomMeetsCourse` + `roomEquipment`/`courseEquipment` in the availability index; `buildAvailabilityIndex` takes a 5th `courses` argument (defaulted, so existing callers are unaffected). |
+
+### Gotchas worth keeping
+
+- **A determinism test can pass for the wrong reason.** The first one used
+  `maxIterations: 40000, timeLimitMs: 2000`; 40k iterations finish in ~50ms, so the clock never bit
+  and both code paths behaved identically — a mutation with the clock put back **passed**. It needs
+  `maxIterations: 200000, timeLimitMs: 5`, where a clock-reading run stops after a few thousand and
+  at a count that varies.
+- **`signals:audit` is right about getters.** Three times in this pass a getter that built a fresh
+  array (`equipmentChips`, `undoableId`, `dayOptionsFor`/`hoursError`) ran per change-detection cycle
+  and made `*ngFor` rebuild. All became fields refreshed on change.
+- The `grid_stale` issue row was rendered by the shared `<a [routerLink]="['/course', course_id]">`,
+  and it has no course — a dead link since 2026-11-06. `grid`-type issues now have their own section.
+- The frontend's cross-repo contract check used to read the API's **default** branch, so any commit
+  calling a route still only on the API's `dev` failed CI — and `release-git.js` refuses to release
+  without green CI, which is a deadlock. It now reads the **same branch name**, falling back to the
+  default.
+
+---
+
+## Changelog — 2026-10 (b): the generator becomes a search (API)
+
+> Recorded **2026-10-25** against API `7ec738b` + working tree (**uncommitted, not deployed** at the
+> time of writing), on top of Q.8. Where it changes §6, §9–§11 or any changelog below, **this block
+> wins**: placement is no longer "one greedy pass, first free slot". Why it was needed: bugs brain
+> repo `scheduling-bugs.md` §2 (ALG-01…09). What it achieved, with numbers: same file, §7.
+
+### R.1 Where the code is
+
+- **`controllers/handlers/scheduleSolver.js`** (new, pure, no DB): `solveTimetable(ctx, lessons, grid,
+  opts)`, `remainingLessons`, `scheduleQuality` (server port of the editor's score),
+  `clashingEntries`, `workingDays`, `WEIGHTS`. It cannot require `schedule.js` (which requires it), so
+  it carries its own copies of the small time/name helpers.
+- **`schedule.js`:** `placeLessons(ctx, lessons, grid, opts)` is now a thin wrapper. It calls the solver,
+  then appends `ctx._coteachIssues` / `ctx._hourIssues` as before. New: `planGeneration(ctx, periodId,
+  current, mode, opts)` (pure: what to keep, which grid, run, score before/after),
+  `generateForSchedule(…, { mode })`, `setEntryLocked`, `diagnose(store, period, { scheduleId })`.
+  `buildLessons` is unchanged. Its sort (hours ↓, students ↓) is now only the tie-break order.
+
+### R.2 Occupancy model
+
+Slot-indexed typed arrays instead of interval lists. Teachers (`t:`), **τμήματα (`c:`)** and students
+(`s:`) share one entity space: `busy[(ent·9 + day)·N + slot]` holds a count, so a lesson can be lifted
+off again. Rooms are a separate array. A τμήμα being an entity is how Q.8's SCH-02 rule lives on: one
+`peopleFree` check covers teacher, τμήμα and students. Per lesson, the **static candidates** are
+precomputed: (day, start) where every slot is teaching time for the teacher (availability minus
+breaks) and no student is blocked. Dynamic checks: people free; room open, free and big enough; C11
+(`cc[day]`, sessions of that course per τμήμα-day); C13 (`classHours`). **Fixed entries** are mapped
+onto the grid by time overlap, so an entry off the grid, or one with a `"NaN:NaN"` end
+(`entryInterval` repairs it as Q.8 does), still blocks what it covers.
+
+### R.3 Phase 1: construction, most-constrained first (ALG-01)
+
+DSatur: at every step, the lesson with the **fewest feasible (day, start, room) triples** goes next
+(ties: `buildLessons` order). Counts are kept per lesson per day. After a placement only **that
+day** is recounted, and only for lessons that share a person (teacher/τμήμα/student) or could use that
+room. A lesson whose count hits 0 is set aside. Its value is the feasible triple with the **lowest
+objective** (R.6), evaluated by apply → score → unapply. Strict `<`, so ties keep the earliest day,
+slot and smallest room. That is why a lone lesson still lands at the first hour.
+
+### R.4 Phase 2: repair (one-lesson ejection)
+
+For each lesson set aside: first a direct try (something may have opened), then every candidate
+(day, start, room) where **exactly one movable** lesson is in the way, through a shared person or
+by holding that room. Lift it, place the new one, re-place the lifted one at its best feasible value;
+undo if that fails. At most 400 tries per lesson. Fixed entries are never lifted. Runs after
+construction and again after the local search.
+
+### R.5 Phase 3: simulated annealing (ALG-08, partly)
+
+Moves: **relocate** (random static candidate, keep the room if free; 55%), **swap** the times of two
+lessons (35%; three times in four the partner shares a τμήμα or teacher, where swaps close gaps),
+**change room** (10%).
+Each move is applied only if every hard constraint holds; otherwise it is undone and skipped. Accept
+if Δ ≤ 0 or with e^(−Δ/T). T0 = the mean worsening of 60 random moves, falling geometrically to
+T0/1000 by progress = max(iterations/cap, time/limit). Limits: `timeLimitMs` 2000,
+`maxIterations` 5000 + 2000·lessons. The **best** state is kept (strict improvement) and restored.
+**Seeded PRNG** (`mulberry32`): the same input gives the same timetable, unless the time limit
+(not the iteration cap) ends the run.
+
+### R.6 The objective is the editor's score (ALG-02/03/04/07)
+
+The solver minimises the editor's `scheduleQuality` penalties (Q.3), with the same weights and the
+same measures (idle **slot indices** per τμήμα-day / teacher-day, cv of hours over the working days,
+(τμήμα, course) rows with consecutive days, room changes per τμήμα-day). It is **uncapped**, so there is
+still a gradient past a cap, and normalised by the live τμήμα-day / teacher-day counts as the score is.
+Totals are maintained incrementally: `begin(it, day)` subtracts the contributions of what a lesson
+touches, `end` adds back the recomputed ones. Two tie-breaks are **not** in the score:
+`teacher_days` 0.05 per teacher-day (the old generator packed teachers onto few days; now balance wins
+unless near a tie) and `room_fit` 0.01 × spare seats / largest room (best-fit keeps big rooms free).
+`scheduleQuality` in the solver is a **port** (caps and rounding included), used for the report and the
+tests. Its conflicts are only the pairwise ones (`clashingEntries`: teacher/room/τμήμα/student overlap,
+C11, C13). Availability and capacity are not re-checked there. Conflicts cannot occur in generated
+output.
+
+### R.7 Fill, fresh and locked (ALG-05)
+
+- **`entry.locked`** (new field, default false). `POST /schedule/lock-entry` `{ schedule_id, entryId,
+  locked: boolean }` → `setEntryLocked` (store-user, `// NEW ROUTE`). UI since Q.10 (inspector toggle).
+- **`mode: "fresh"`** (default): keep the **locked** entries, place everything else around them on a
+  rebuilt grid. If a locked entry would not sit on the rebuilt grid (`sitsOnGrid`: start on a slot,
+  end on its last slot's end), the schedule's **own** grid is kept instead, so the lock still holds
+  and the lesson stays drawable. Unlocked entries, hand-placed ones included, are replaced.
+- **`mode: "fill"`**: keep **every** entry and the schedule's own grid; place only
+  `remainingLessons(buildLessons(…), kept)`. That is the same multiset subtraction per obligation
+  (`co:` group|course, `cl:` class|course, `pr:` student|course) and length as the palette's
+  `remainingHours`, so fill places exactly the chips the editor shows.
+- Kept entries are written back as plain objects with their `_id`, flags and labels. `slot_minutes`
+  and `time_slots` are only rewritten when the grid was rebuilt.
+- The controller refuses an unknown `mode` (400 `invalid_mode`), so a typo cannot wipe a hand-made
+  timetable. The response adds **`report`** (from `schedule.$locals.report`): `mode, kept, placed,
+  unscheduled, grid: "rebuilt"|"kept", score_before, score_after, penalties_after, search: {
+  repaired, iterations, improvements, ms }`.
+
+### R.8 Unscheduled reasons
+
+Same ladder as §0.8 plus Q.8's `class_busy` (severity 3, preferred over `students_conflict` when the
+τμήμα itself is in the way), and the same `details[]` kinds. Both are now computed against the
+**final** timetable, not at the moment the lesson failed, so every lesson a detail names is really
+on the saved timetable.
+
+### R.9 The `legacy` strategy (the baseline)
+
+`opts.strategy: "legacy"` replays the old pass inside the solver: static order, and the value is the
+lexicographic minimum of (same course on an adjacent day, teacher not yet teaching that day, day,
+start, room rank). That is exactly the old day sort plus earliest slot plus best-fit room. No repair, no
+search. The class rule of Q.8 applies to it too. It exists for the tests and for
+`scripts/diagnoseSchedule.js`, which now prints **legacy / construct / search** side by side (placed,
+unscheduled, score, penalties, idle hours, ms), the saved timetable's score (`--schedule <id>` picks one
+other than the default), and a **fill** dry run on it.
+
+### R.10 Verification (2026-10-25)
+
+- `controllers/handlers/__tests__/scheduleSolver.test.js`, 12 specs: the 2-afternoon teacher (legacy
+  leaves both lessons out as `class_busy`, search places them), repair (the ιδιαίτερο behind a τμήμα),
+  τμήμα gaps (legacy > 0, search 0, score up), front-loading (legacy Mon 8h / Thu–Fri 0, search within
+  2h), fill (2h placed by hand subtracted, 1h not, C11 respected around it), fresh keeps locked +
+  fill keeps all on the own grid, locked off the rebuilt grid keeps the own grid, SA with a locked
+  entry and a blocked student (no hard violation, locked untouched), determinism, the score
+  arithmetic against a hand-computed 50, 200 lessons in < 1 s. Q.8's 6 specs pass unchanged on the
+  new solver. `npm test` **331/331**; `node --check` on every touched file.
+- `diagnoseSchedule.js` on the dev DB (read-only), store Κιζιρίδη, 30 lessons: legacy 22 placed,
+  score 58, 10 idle τμήμα-hours → construct 24, 90, 0 → search 24, 91, 0 (68 ms). Fill on the saved
+  4-entry timetable: keeps 4, adds 20, score 90 → 91. The 6 left are `teacher_no_availability` (data).
+- Synthetic: 400 lessons, construct ~100 ms, search to the iteration cap in ~1 s, score 97 → 100.
+
+### R.11 Gotchas and open points
+
+- **Balance counts days nothing can use.** The score's (and so the solver's) working days are the days
+  some teacher **or** some room works. On dev, Saturday has a teacher but no room, so its load is
+  always 0 and «balance» never clears. Suggest: teacher **and** room, in the frontend `days` and in
+  `workingDays` together, or the two disagree.
+- **Teacher days** are not in the score (see R.6). A product decision decides whether they enter both.
+- No late-hour penalty, no room equipment, one solution per run (no compare).
+- The generate request now runs up to ~2 s longer on a big store (still far under API Gateway's 29 s).
+- UI still to do: «Συμπλήρωση υπολοίπων» → `generate` with `mode: "fill"`, a lock toggle per lesson,
+  `ScheduleEntry.locked` in `schedule.model.ts`, showing `report`, and a fresh-regenerate confirm
+  that says locked lessons stay. i18n for `invalid_mode`, `lock_entry_success`,
+  `unlock_entry_success`, `lock_entry_fail`.
+
+---
+
+## Changelog — 2026-10: the `.sd-*` editor, overview, live check, quality
+
+> Recorded **2026-10-25**, against frontend `0f1fbfa` + working tree (uncommitted at the time of
+> writing) and API `7ec738b`. **Frontend only — no API change in either pass.** Where it changes
+> §8 or the changelogs below, **this block wins**. The weakness analysis that motivated the second
+> pass (algorithm + UI, with the open bugs SCH-01…08) lives in the **bugs brain repo →
+> `scheduling-bugs.md`**.
+
+### Q.1 2026-10-01 — `/schedules/:id` rebuilt as the `.sd-*` editor
+
+`SchedulingComponent` was rebuilt for usability: header with name, «Κανονικό», «Σε ισχύ σήμερα»
+(computed from the `listSchedules` siblings) and the meta modal (`schedules/schedule-meta-modal/`,
+also used by the `/schedules` list for create + edit). A Εβδομάδα|Ημέρα toolbar, 4 **faceted**
+filters that **dim** (do not hide) lessons, «Χρώμα ανά» τάξη/μάθημα/καθηγητή (golden-angle hues,
+`--hue` + `hsl()`, no `color-mix()` because old Android WebViews lack it), a docked side panel
+(drawer below 1200px) with «Τοποθέτηση» (palette) and «Προβλήματα». Place/move by drag **or**
+tap-chip-then-tap-cell, an empty-cell "what fits here" popover, a lesson inspector popover, and
+an «Αναίρεση» toast after every write. Prefs in `localStorage['scheduleEditor:prefs']`.
+
+Non-obvious decisions (still true):
+- `schedule-grid.util.ts` **mirrors the API's `evaluatePlacement`** client-side, so the grid shows
+  where a lesson fits before the drop. An unknown teacher/room counts as "not checked", never as
+  "unavailable". Room overlap and grid overflow are **blocked** in the UI, because two lessons
+  cannot be drawn in one room cell (the server would only flag `room_busy`).
+- `schedule.unscheduled` is a generation-time snapshot the server never updates →
+  `matchUnscheduled` attaches reasons to the remaining palette chips as a multiset.
+- The dragged lesson's DOM node must survive the re-render, or `dragend` is lost: the same element
+  stays as a faint ghost (cells tracked by key). Firefox needs `dataTransfer.setData`.
+- Styles are **global** (`src/theme/schedule-editor.scss`, imported in `global.scss`): the page
+  broke the 32 kB `anyComponentStyle` budget, and Ionic moves inline popovers into `ion-app`.
+
+### Q.2 2026-10-25 — live validation (`validateSchedule`)
+
+The server stamps `has_conflict`/`conflict_reasons` on the ONE entry placed or moved, at that
+moment: the lesson it landed on stays clean (asymmetric), the flag outlives the conflict once
+either side moves (stale), and data changes underneath (availability, capacity, rosters) never
+surface (bugs repo SCH-03). The editor now **recomputes every conflict on every rebuild**,
+client-side, in `validateSchedule(entries, grid, avail)`:
+- pairwise per day, sorted by start: `teacher_busy`, `room_busy`, **`class_busy`** (shared τμήμα:
+  catches an **empty τμήμα** double-booked, which the generator misses, see SCH-02) or else
+  `student_busy`. **Both** entries get the reason;
+- per entry against today's data: `no_room_capacity`, `teacher_unavailable`, `room_unavailable`,
+  `student_unavailable` (slot by slot, so a break inside a lesson needs no availability);
+- the τμήμα rules hand placement skips (SCH-04): **`class_course_twice`** and **`class_over_limit`**
+  (`MAX_CLASS_HOURS_PER_DAY = 6`, mirrored from the generator).
+- Students are read **live** (`liveStudentIds`): a class lesson uses today's roster
+  (`rosterByClass`), a co-taught one adds its stored set (explicit ιδιαίτερα members are on no
+  roster), a private one its `student_id`. Until the period is known (`avail.loaded`), the stamped
+  server reasons are unioned in.
+- The result drives `EntryVM.hasConflict/reasons`, the «συγκρούσεις» figure and the panel. The
+  stored flag is no longer what the UI shows. The API is unchanged (follow-up: the same check
+  server-side in `getManualData`).
+
+### Q.3 2026-10-25 — quality score (`scheduleQuality`)
+
+The first measure of whether a timetable is *good*, not only conflict-free. It gives 0–100 = 100
+minus capped penalties, normalised per τμήμα-day / teacher-day so a big store is not marked down
+for being big:
+
+| Penalty | Max | Measure |
+|---|---|---|
+| conflicts | 40 | 8 × entries with ≥1 live reason |
+| class_gaps | 25 | 25 × idle teaching hours per τμήμα-day (`idleSlots` over slot indices, so breaks never count) |
+| teacher_gaps | 15 | 10 × idle hours per teacher-day |
+| balance | 10 | 20 × coefficient of variation of hours over the working days |
+| spread | 5 | 1 per (τμήμα, course) with sessions on consecutive days (the generator's soft C12) |
+| rooms | 5 | 5 × room changes per τμήμα-day |
+
+Bands: ≥85 «Πολύ καλό», ≥65 «Καλό», else «Θέλει δουλειά». Each penalty carries its rows (which
+τμήμα/teacher, how many hours on how many days). Clicking a row sets that filter. Shown as a ring
+in the header and as the top card of the panel tab, renamed «Προβλήματα» → **«Έλεγχος»** (internal
+key still `problems`), with a bar chart of hours per day. The weights are a product judgement, not
+measured against any data. Tune them in `scheduleQuality`.
+
+### Q.4 2026-10-25 — «Επισκόπηση» (overview) view
+
+A third view next to Εβδομάδα|Ημέρα. The room grid (days × rooms = 30 columns at 6 days × 5 rooms;
+1.5 days visible at 1600px) answers "where is there space?". The overview answers "what does Β1
+have on Tuesday?":
+- rows = **τμήματα** (grouped by τάξη, then an «Ιδιαίτερα» group per student) | **καθηγητές** |
+  **αίθουσες** (`pivot`, saved in prefs); columns = days (they share the width,
+  `min-width: calc(head + days × 124px)`); each cell lists the day's lessons in order with
+  **«κενό Nω»** markers between them (not for rooms). Row header: hours/week, days (teachers),
+  gaps, and **«+N»** = palette chips still to place for that row (opens the palette, filtered).
+  Clicking a row's name toggles that filter. Rows with nothing matching an active filter are
+  **hidden** here (unlike the grid's dimming: a row is a perspective, not a drop target), with a
+  «N γραμμές κρύβονται» note.
+- **Placing from the overview:** while a lesson is picked up, the rows it can go in (its τμήμα /
+  its private student / its teacher; every room in room pivot) list each day's **free times**. The
+  admin picks only the time. **`bestRoomDrop`** picks the room: the preferred one (a move keeps its
+  room; a placement prefers the τμήμα's most-used room), else the smallest that fits cleanly, else
+  the warn with the fewest reasons. Only **clean** times are listed. A day with none shows one
+  «N με σύγκρουση…» button that unfolds the override times (`unfolded` set, cleared on every new
+  pick-up). Commits go through the same `commitAt` → `placeEntry`/`moveEntry` as the grid.
+- The moving lesson stays drawn (dashed, `is-moving`) so `dragend` is not lost, the same rule as
+  the grid's ghost.
+
+### Q.5 2026-10-25 — smaller changes
+
+- **Header:** the 4 stat tiles became one KPI row inside the header (lessons + progress, to place,
+  conflicts, quality ring, issues only when >0). The «Επεξεργασία στοιχείων» button became a pencil
+  next to the title. This saves ~110px before the grid.
+- **«Συμπαγής προβολή»** (was «Μόνο αίθουσες με μαθήματα», same pref key `compactRooms`) now also
+  **trims the empty hours** at both ends of the day (`computeShownSlots`). The range covers every
+  lesson of the shown days, dimmed or not, so no lesson is cut. It is suspended while a lesson is
+  picked up. On dev the first screen was 10:00–16:45, all empty; it is now 17:20–20:30.
+- **Separate view per form factor:** `view` (wide) and `viewNarrow` in prefs, so choosing the week
+  on a desktop no longer opens the 30-column week on a phone.
+- **Lazy routes:** `/schedules` and `/schedules/:id` use `loadComponent`, so the editor (the
+  biggest single component) left the initial bundle, which sits ~70 kB under its 5.25 MB budget.
+
+### Q.6 Verification (2026-10-25)
+
+- `schedule-grid.util.spec.ts` (new, 15 specs) covers `entrySlots`, `liveStudentIds`,
+  `validateSchedule` (both sides, empty τμήμα, touching, student in two places,
+  availability/capacity/blocked, τμήμα rules), `idleSlots`, `scheduleQuality`, `bestRoomDrop`.
+  Full `test:ci` **1678/1678**; typecheck, eslint, `signals:audit` (component stays at 0 calls /
+  0 getters) and `i18n:keys` are clean.
+- Run against the **deployed dev API** with the real store data (4 lessons, 26 chips, 5 rooms)
+  through a throwaway Playwright probe that **refused any write request**. Checked: week + compact
+  (16 → 4 rows, back to 16 while a chip is picked up), overview by τμήμα and by teacher, a chip
+  picked up (clean times on the teacher's 2 available days, the other 4 folded), the «Έλεγχος» tab,
+  dark mode, phone at 390px (no horizontal page scroll). **Not exercised:** an actual place/move
+  from the overview, which writes to the shared dev DB. That path is the same `commitAt` the grid
+  uses.
+
+### Q.7 File map
+
+- `src/app/scheduling/schedule-grid.util.ts`: + `AvailabilityIndex.loaded`, `GridIndex`,
+  `entrySlots`, `liveStudentIds`, `validateSchedule`, `MAX_CLASS_HOURS_PER_DAY`, `idleSlots`,
+  `scheduleQuality` (+ `QualityReport/Penalty/Row`), `bestRoomDrop`, `RoomOption`.
+- `src/app/scheduling/schedule-grid.util.spec.ts`: new.
+- `src/app/scheduling/scheduling.component.{ts,html}`: live reasons on `EntryVM`, `buildQuality`,
+  `buildOverview` (+ `OvRowVM/OvCellVM/OvItemVM/OvTargetVM`), `computeShownSlots`, `allRooms`,
+  `setPivot`, `focusRow`, `openRowPalette`, `unfoldCell`, `commitTarget`, `focusQualityRow`, KPI
+  header, «Έλεγχος» tab.
+- `src/theme/schedule-editor.scss`: `.sd-kpi*`, `.sd-ring`, `.sd-ov*`, `.sd-quality`, `.sd-load*`,
+  `.sd-q*`. The `.sd-stat*` / `.sd-edit` rules were removed.
+- `src/app/app-routing.module.ts`: both schedule routes are lazy.
+- i18n `schedule.page.{view_overview*, pivot*, compact*, check, quality*, day_load, q_*,
+  live_check_hint, gap_n, row_*, show_only_row, ov_*}`, `schedule.reasons.{class_busy,
+  class_course_twice, class_over_limit}`. `compact_rooms*` were removed.
+- `docs/flows/F05-build-timetable.md` (§1, §3, the overview subsection) and
+  `docs/releases/unreleased.md` (one entry).
+
+### Q.8 2026-10-25 — API: whole hours only (SCH-01) and the τμήμα's own occupancy (SCH-02)
+
+The first change to `Frontistirio-API/controllers/handlers/schedule.js` in this block (uncommitted at
+the time of writing). Details and the reasoning are in the bugs brain repo `scheduling-bugs.md` §6.
+- **SCH-01:** a session length must be a whole number of slots. `buildLessons` (`pushSession`) reports
+  a fractional one as unscheduled **`fractional_hours`**. The palette lists it as the issue
+  **`fractional_hours`** instead of a chip that no cell could take. `evaluatePlacement` refuses it
+  with the fatal **`invalid_hours`** (409). Entries already saved with `endTime: "NaN:NaN"` are counted
+  by `buildOccupancy(entries, excludeId, D)` as `start + ceil(hours)·D`. The editor's live check
+  flags them **`invalid_hours`**. The course form still steps by 0.5, which is an open decision.
+- **SCH-02:** `placeLessons` keeps `classBusy[classId|day]` (reason **`class_busy`**, severity 3,
+  detail `class_busy` naming the blocking course). `buildOccupancy` also returns `klass`.
+  `evaluatePlacement` takes `class_ids` and flags `class_busy`; `placeEntry`/`moveEntry` pass them.
+  This supersedes C7's "a τμήμα is busy only through its students".
+- New `exports._internals` (`buildLessons`, `buildSlotGrid`, `placeLessons`, `buildOccupancy`,
+  `evaluatePlacement`, `buildManualPalette`) and the API's first schedule tests,
+  `controllers/handlers/__tests__/scheduleGenerator.test.js` (6 specs on a hand-built context, all
+  failing on HEAD). `npm test` 319/319. Frontend `evaluateDrop` now says `class_busy` too, plus i18n
+  for the new keys (frontend `test:ci` 1679/1679). **Not deployed.**
+
+### Q.9 2026-10-27 — visual pass: editor chrome, grid, palette, and the `/schedules` list
+
+Frontend only, uncommitted at the time of writing. Verified with a read-only Playwright probe on the
+dev API (light/dark/390px, write routes aborted; no console errors), typecheck, eslint, `signals:audit`
+(both components at 0 calls / 0 getters; the list dropped its one `rangeLabel()` call), `i18n:keys`,
+`test:ci` 1679/1679.
+- **Toolbar → one wrapping row:** views · **filter pills** · display controls · panel toggle. The four
+  full-width selects became `ion-select.sd-fpill`. The facet name is the select `label`
+  (`labelPlacement="start"`), the choice follows, the placeholder is «Όλες/Όλα/Όλοι»
+  (`schedule.page.all_f/n/m`), and the ✕ is `ClearableSelectDirective` (its `ionChange` re-filters).
+  The options popover is `size: 'auto'` (`pillPopover`), so names are not cut to the pill's width.
+  The chip row, `filterChips`, `clearFilter()` and `filtersOpen` were removed. Below 992px the
+  pills get a row of their own and scroll sideways.
+- **Header figures → one divided strip** (number over label, tone in icon/number). On a phone it
+  becomes a grid: lessons across the top, the rest under it.
+- **Grid:** slot rules recede to `--sd-line`. Every other day is banded (`--sd-band` as a gradient over
+  the opaque background, so the sticky headers stay opaque). Today's day header is underlined. A red
+  **current-time line** runs across today's empty cells, with a dot at the day edge and the time in
+  red. It is drawn only when this schedule is in effect today, and redrawn every 2 min (`clock`,
+  paused while a lesson is picked up). Cards are a touch roomier and show the course without its
+  τάξη prefix (`EntryVM.courseShort`).
+- **Palette:** each session is a calm full-width row (neutral surface, hue bar, course without
+  prefix, teacher, hours). **Identical sessions fold into one row with «×N»**
+  (`PaletteRowVM.items`); a drag or tap takes the first. On dev that is 26 → 15 rows.
+- **`/schedules` list rebuilt:**
+  - a **«Πότε ισχύει τι»** strip of the period (admin's `active_period` override, else the default
+    period), month ticks, each alternative's ranges as hue segments over the default, a «Σήμερα»
+    flag;
+  - a card grid where each card carries a status (**σε ισχύ σήμερα / προσεχώς / σήμερα ισχύει
+    άλλο / χωρίς ημερομηνίες / έληξε**, sorted that way after the default), range chips with
+    day counts, lessons + «δεν χώρεσαν», «Ενημερώθηκε πριν από …» (`Intl.RelativeTimeFormat`,
+    `numeric: 'always'` because «auto» gave «προηγούμενος μήνας»);
+  - a ⋯ RowMenu (open / edit / delete) on each card, the whole card a stretched `routerLink`, and a
+    dashed «Νέο πρόγραμμα» card that says what an alternative is for.
+- Docs: F05 (pills, ×N) and F13 (list statuses, the strip) updated; one bullet added to the release
+  note.
+
+### Q.10 2026-10-27 — fill / fresh choice and lesson locking in the editor (UI for R.7)
+
+Frontend only, uncommitted at the time of writing. **Deploy the API first**: the old API ignores
+`mode`, so a «Συμπλήρωση υπολοίπων» sent to it runs a full rebuild and undoes every hand placement;
+`/lock-entry` does not exist there at all.
+- `ScheduleService.generateSchedule(id, mode = 'fresh')` now ALWAYS sends `mode` (also `'fresh'`,
+  explicitly); `lockEntry(id, entryId, locked)` → `POST /schedule/lock-entry`. `ScheduleResponse.report`
+  typed as `GenerateReport` (`mode/kept/placed/unscheduled/grid/score_before/score_after`).
+  `ScheduleEntry.locked`.
+- **The generate button** keeps one label («Αυτόματη δημιουργία») with a chevron once the timetable
+  has lessons. Click → an `ion-popover` (`genMenu`, `.sd-gen*`) with two described options:
+  **Συμπλήρωση υπολοίπων** (disabled with «Δεν λείπει κανένα μάθημα» when `stats.remaining` is 0)
+  and **Από την αρχή** (its hint names the locked count), plus a tip pointing at locking. An empty
+  timetable (and the two empty-state buttons, which pass no event) still generates «fresh» directly.
+- **The confirm moved**: the old «there are manual placements» alert used to fire on ANY manual entry;
+  now only «Από την αρχή» with `stats.loose > 0` (manual AND not locked) asks, and the message names
+  both counts. «Fill» never asks — it moves nothing.
+- **Toasts** read `res.report`: fill → «Μπήκαν ακόμα N μαθήματα — τα υπόλοιπα έμειναν στη θέση
+  τους» (+ «M δεν χώρεσαν»), or «Δεν βρέθηκε θέση για κανένα από τα M…»; fresh keeps the old
+  generated_all/partial text.
+- **Locking**: inspector gets a full-width toggle (`.sd-btn.is-wide`, `.is-on` when locked,
+  `aria-pressed`) «Κλείδωμα στη θέση του» / «Ξεκλείδωμα», a «Κλειδωμένο — μένει εδώ…» fact line, a
+  `lock-closed` flag on the grid card (before the hand flag) and a legend entry. `EntryVM.isLocked`,
+  `stats.locked`, `stats.loose`. Locked lessons can still be moved/removed by hand (the API allows it).
+- Verified: typecheck, eslint, `signals:audit` (editor still 0 calls), `i18n:keys`, `api:contract`,
+  `plan:contract`, `test:ci` 1681/1681 (3 new service-contract cases: fresh-by-default, fill,
+  lock-entry). **Not** driven in a logged-in browser: the probe session had expired; the popover,
+  inspector toggle, card flag and legend were checked in a static harness (real compiled
+  `global.scss` + `variables.scss`, light + dark), which caught the lock fact line squeezed into half
+  of the 2-column facts grid (now `grid-column: 1 / -1`).
+- Docs: F05 §5 rewritten (fill vs fresh table, locking), §2/§3/§4 + «Γιατί δεν βλέπω» adjusted;
+  two release-note bullets.
 
 ---
 
@@ -845,6 +1415,11 @@ a constraint violation (frontend reads `err.error.message` as the reason key).
 ---
 
 ## 6. The algorithm — `controllers/handlers/schedule.js`
+
+> **UPDATED 2026-10-25 — see [changelog R](#changelog--2026-10-b-the-generator-becomes-a-search-api).**
+> 6.1–6.4 (helpers, context, lessons, grid) still hold. **6.5 is history**: placement lives in
+> `scheduleSolver.js` and is a search (most-constrained first, cost-based choice, repair, simulated
+> annealing), not a greedy pass. The old pass survives only as `strategy: "legacy"`.
 
 This file is the heart of the system. It is a **deterministic greedy heuristic**, not
 an optimal constraint solver. Sections below follow the code top to bottom.
